@@ -115,8 +115,8 @@ def train(config):
     trainer = pl.Trainer(
         resume_from_checkpoint=config.get("resume_from_checkpoint_path", None),
         num_nodes=config.get("num_nodes", 1),
-        gpus=torch.cuda.device_count(),
-        strategy="ddp",
+        gpus=1,#torch.cuda.device_count(),
+        #strategy="ddp",
         accelerator="gpu",
         plugins=custom_ckpt,
         max_epochs=config.max_epochs,
@@ -129,7 +129,7 @@ def train(config):
         logger=logger,
         callbacks=[lr_callback, checkpoint_callback],
     )
-
+    print("Starting Training")
     trainer.fit(model_module, data_module)
 
 

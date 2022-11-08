@@ -157,7 +157,7 @@ class BARTDecoder(nn.Module):
         self.max_position_embeddings = max_position_embeddings
 
         self.tokenizer = XLMRobertaTokenizer.from_pretrained(
-            "hyunwoongko/asian-bart-ecjk" if not name_or_path else name_or_path
+            "hyunwoongko/asian-bart-en" if not name_or_path else name_or_path
         )
 
         self.model = MBartForCausalLM(
@@ -439,13 +439,17 @@ class DonutModel(PreTrainedModel):
 
         if image_tensors is None:
             image_tensors = self.encoder.prepare_input(image).unsqueeze(0)
-
         if self.device.type == "cuda":  # half is not compatible in cpu implementation.
+            #print("###########GPU INFERENCE")
             image_tensors = image_tensors.half()
             image_tensors = image_tensors.to(self.device)
         else:
-            image_tensors = image_tensors.to(torch.bfloat16)
-
+            #print("###########CPU INFERENCE")
+            #image_tensors = image_tensors.to(dtype=torch.bfloat16, device=self.device)
+            #image_tensors = image_tensors.half()
+            image_tensors = image_tensors.to(device=self.device)
+            #image_tensors = image_te
+            #print(type(image_tensors))
         if prompt_tensors is None:
             prompt_tensors = self.decoder.tokenizer(prompt, add_special_tokens=False, return_tensors="pt")["input_ids"]
 

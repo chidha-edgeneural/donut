@@ -17,6 +17,7 @@ from tqdm import tqdm
 
 from donut import DonutModel, JSONParseEvaluator, load_json, save_json
 
+import torch
 
 def test(args):
     pretrained_model = DonutModel.from_pretrained(args.pretrained_model_name_or_path)
@@ -38,7 +39,11 @@ def test(args):
     dataset = load_dataset(args.dataset_name_or_path, split=args.split)
 
     for idx, sample in tqdm(enumerate(dataset), total=len(dataset)):
+        print(args.task_name)
+        print(sample)
         ground_truth = json.loads(sample["ground_truth"])
+        #print(args.task_name)
+        print(ground_truth)   
 
         if args.task_name == "docvqa":
             output = pretrained_model.inference(
