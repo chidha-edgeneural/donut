@@ -115,8 +115,8 @@ def train(config):
     trainer = pl.Trainer(
         resume_from_checkpoint=config.get("resume_from_checkpoint_path", None),
         num_nodes=config.get("num_nodes", 1),
-        gpus=1,#torch.cuda.device_count(),
-        #strategy="ddp",
+        gpus=2,#torch.cuda.device_count(),
+        strategy="ddp",
         accelerator="gpu",
         plugins=custom_ckpt,
         max_epochs=config.max_epochs,
