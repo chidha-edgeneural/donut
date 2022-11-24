@@ -21,6 +21,7 @@ from torchvision import transforms
 from torchvision.transforms.functional import resize, rotate
 from transformers import MBartConfig, MBartForCausalLM, XLMRobertaTokenizer
 from transformers.file_utils import ModelOutput
+from transformers.utils.generic import to_py_obj
 from transformers.modeling_utils import PretrainedConfig, PreTrainedModel
 
 
@@ -206,7 +207,7 @@ class BARTDecoder(nn.Module):
         if newly_added_num > 0:
             self.model.resize_token_embeddings(len(self.tokenizer))
 
-    def prepare_inputs_for_inference(self, input_ids: torch.Tensor, encoder_outputs: torch.Tensor, past=None, use_cache: bool = None, attention_mask: torch.Tensor = None):
+    def prepare_inputs_for_inference(self, input_ids: torch.Tensor, past=None, use_cache: bool = None, **model_kwargs):
         """
         Args:
             input_ids: (batch_size, sequence_lenth)
@@ -223,7 +224,7 @@ class BARTDecoder(nn.Module):
             "attention_mask": attention_mask,
             "past_key_values": past,
             "use_cache": use_cache,
-            "encoder_hidden_states": encoder_outputs.last_hidden_state,
+            "encoder_hidden_states": model_kwargs["encoder_outputs"].last_hidden_state,
         }
         return output
 
@@ -314,6 +315,134 @@ class BARTDecoder(nn.Module):
                 .permute(1, 0)
             )
         return weight
+
+    def batch_custom_decode(
+        self,
+        sequences: Union[List[int], List[List[int]], "np.ndarray", "torch.Tensor"],
+        confidences: Union[List[float], List[List[float]], "np.ndarray"],
+        decoder_delim: str,
+        skip_special_tokens: bool = False,
+        clean_up_tokenization_spaces: bool = True,
+        **kwargs
+    ) -> List[str]:
+        """
+        Convert a list of lists of token ids into a list of strings by calling decode.
+        Args:
+            sequences (`Union[List[int], List[List[int]], np.ndarray, torch.Tensor, tf.Tensor]`):
+                List of tokenized input ids. Can be obtained using the `__call__` method.
+            confidences (`Union[List[float], List[List[float]], np.ndarray]`):
+                List of confidence scores for corresponding tokens in sequences list
+            decoder_delim ('str'):
+                delimiter for the decoded tokens, must q unique token that should not appear in text
+            skip_special_tokens (`bool`, *optional*, defaults to `False`):
+                Whether or not to remove special tokens in the decoding.
+            clean_up_tokenization_spaces (`bool`, *optional*, defaults to `True`):
+                Whether or not to clean up the tokenization spaces.
+            kwargs (additional keyword arguments, *optional*):
+                Will be passed to the underlying model specific decode method.
+        Returns:
+            `List[str]`: The list of decoded sentences.
+        """
+        self.DELIM = decoder_delim
+        return [
+            self.custom_decode(
+                seq,
+                conf,
+                skip_special_tokens=skip_special_tokens,
+                clean_up_tokenization_spaces=clean_up_tokenization_spaces,
+                **kwargs,
+            )
+            for seq, conf in zip(sequences, confidences)
+        ]
+
+    def custom_decode(
+        self,
+        token_ids: Union[int, List[int], "np.ndarray", "torch.Tensor"],
+        token_confs: Union[int, List[float], "np.ndarray"],
+        skip_special_tokens: bool = False,
+        clean_up_tokenization_spaces: bool = True,
+        **kwargs
+    ) -> str:
+        """
+        Converts a sequence of ids in a string, using the tokenizer and vocabulary with options to remove special
+        tokens and clean up tokenization spaces.
+        Similar to doing `self.convert_tokens_to_string(self.convert_ids_to_tokens(token_ids))`.
+        Args:
+            token_ids (`Union[int, List[int], np.ndarray, torch.Tensor, tf.Tensor]`):
+                List of tokenized input ids. Can be obtained using the `__call__` method.
+            token_confs (`Union[float, List[float], np.ndarray]`):
+                List of confidence scores for corresponding tokens
+            skip_special_tokens (`bool`, *optional*, defaults to `False`):
+                Whether or not to remove special tokens in the decoding.
+            clean_up_tokenization_spaces (`bool`, *optional*, defaults to `True`):
+                Whether or not to clean up the tokenization spaces.
+            kwargs (additional keyword arguments, *optional*):
+                Will be passed to the underlying model specific decode method.
+        Returns:
+            `str`: The decoded sentence.
+        """
+        # Convert inputs to python lists
+        token_ids = to_py_obj(token_ids)
+        token_confs = to_py_obj(token_confs)
+
+        return self._custom_decode(
+            token_ids=token_ids,
+            token_confs=token_confs,
+            skip_special_tokens=skip_special_tokens,
+            clean_up_tokenization_spaces=clean_up_tokenization_spaces,
+            **kwargs,
+        )
+
+    def _custom_decode(
+        self,
+        token_ids: List[int],
+        token_confs: List[float],
+        skip_special_tokens: bool = False,
+        clean_up_tokenization_spaces: bool = True,
+        spaces_between_special_tokens: bool = True,
+        **kwargs
+    ) -> str:
+        self._decode_use_source_tokenizer = kwargs.pop("use_source_tokenizer", False)
+
+        filtered_tokens = self.tokenizer.convert_ids_to_tokens(token_ids, skip_special_tokens=skip_special_tokens)
+
+        # To avoid mixing byte-level and unicode for byte-level BPT
+        # we need to build string separately for added tokens and byte-level tokens
+        # cf. https://github.com/huggingface/transformers/issues/1133
+        sub_texts = []
+        sub_confs = []
+        current_sub_text = []
+        current_sub_confs = []
+
+        for token, conf in zip(filtered_tokens, token_confs):
+            if skip_special_tokens and token in self.tokenizer.all_special_ids:
+                continue
+            if token in self.tokenizer.added_tokens_encoder:
+                if current_sub_text:
+                    sub_texts.append(self.tokenizer.convert_tokens_to_string(current_sub_text))
+                    current_sub_text = []
+                    sub_confs.append(sum(current_sub_confs) / len(current_sub_confs))
+                    current_sub_confs = []
+                sub_texts.append(token)
+                sub_confs.append(conf)
+            else:
+                current_sub_text.append(token)
+                current_sub_confs.append(conf)
+        if current_sub_text:
+            sub_texts.append(self.tokenizer.convert_tokens_to_string(current_sub_text))
+            sub_confs.append(sum(current_sub_confs) / len(current_sub_confs))
+
+        decoder_output_confs = sub_confs
+        if spaces_between_special_tokens:
+            text = self.DELIM.join(sub_texts)
+        else:
+            text = "".join(sub_texts)
+
+        if clean_up_tokenization_spaces:
+            clean_text = self.tokenizer.clean_up_tokenization(text)
+            return clean_text, decoder_output_confs
+        else:
+            return text, decoder_output_confs
 
 
 class DonutConfig(PretrainedConfig):
@@ -443,8 +572,6 @@ class DonutModel(PreTrainedModel):
         if self.device.type == "cuda":  # half is not compatible in cpu implementation.
             image_tensors = image_tensors.half()
             image_tensors = image_tensors.to(self.device)
-        else:
-            image_tensors = image_tensors.to(torch.bfloat16)
 
         if prompt_tensors is None:
             prompt_tensors = self.decoder.tokenizer(prompt, add_special_tokens=False, return_tensors="pt")["input_ids"]
@@ -475,14 +602,30 @@ class DonutModel(PreTrainedModel):
             bad_words_ids=[[self.decoder.tokenizer.unk_token_id]],
             return_dict_in_generate=True,
             output_attentions=return_attentions,
+            output_scores=True,
         )
 
+        decoder_output_confs = torch.amax(torch.stack(decoder_output.scores, dim=1).softmax(-1), 2).cpu().numpy()[0]
+        # add score for end token and wrap scores in a list
+        decoder_output_confs = [np.concatenate([decoder_output_confs, [1.]], axis=0)]
+
         output = {"predictions": list()}
-        for seq in self.decoder.tokenizer.batch_decode(decoder_output.sequences):
-            seq = seq.replace(self.decoder.tokenizer.eos_token, "").replace(self.decoder.tokenizer.pad_token, "")
-            seq = re.sub(r"<.*?>", "", seq, count=1).strip()  # remove first task start token
+        print("Output list of Prediction:", output)
+        self.DELIM = "}~}~}~{"  # important, use a DELIM that has a very low prob of appearing in text
+
+        for seq, confs in self.decoder.batch_custom_decode(decoder_output.sequences, decoder_output_confs, self.DELIM):
+            eos_tkn, pad_tkn = self.decoder.tokenizer.eos_token, self.decoder.tokenizer.pad_token
+            split_seq = [tkn for tkn in seq.split(self.DELIM) if tkn]
+            confs = [confs[i] for i, tkn in enumerate(split_seq)
+                     if not(tkn.strip().lower() == eos_tkn.lower() or tkn.strip().lower() == pad_tkn.lower())]
+            seq = seq.replace(eos_tkn, "").replace(pad_tkn, "")
+            for i, tkn in enumerate(seq.split(self.DELIM)):
+                if re.search(r"<.*?>", tkn, re.IGNORECASE):  # remove first task start token conf
+                    confs.pop(i)
+                    break
+            seq = re.sub(r"<.*?>", "", seq, count=1).strip(self.DELIM)  # remove first task start token
             if return_json:
-                output["predictions"].append(self.token2json(seq))
+                output["predictions"].append(self.token2json_with_confs(seq, confs, delim=self.DELIM))
             else:
                 output["predictions"].append(seq)
 
@@ -526,7 +669,7 @@ class DonutModel(PreTrainedModel):
                 obj = f"<{obj}/>"  # for categorical special tokens
             return obj
 
-    def token2json(self, tokens, is_inner_value=False):
+    def token2json(self, tokens: str, is_inner_value: bool = False) -> List[dict]:
         """
         Convert a (generated) token seuqnce into an ordered JSON format
         """
@@ -568,7 +711,7 @@ class DonutModel(PreTrainedModel):
                         if len(output[key]) == 1:
                             output[key] = output[key][0]
 
-                tokens = tokens[tokens.find(end_token) + len(end_token) :].strip()
+                tokens = tokens[tokens.find(end_token) + len(end_token):].strip()
                 if tokens[:6] == r"<sep/>":  # non-leaf nodes
                     return [output] + self.token2json(tokens[6:], is_inner_value=True)
 
@@ -576,6 +719,87 @@ class DonutModel(PreTrainedModel):
             return [output] if is_inner_value else output
         else:
             return [] if is_inner_value else {"text_sequence": tokens}
+
+    def token2json_with_confs(self, tokens: str, confs: List[float], delim: str, is_inner_val: bool = False) -> List[dict]:
+        """
+        Convert a (generated) token sequence into an ordered JSON format
+        confs is a list of confidences for each token separated by delim
+        """
+        output = dict()
+
+        while tokens:
+            start_token = re.search(r"<s_(.*?)>", tokens, re.IGNORECASE)
+            if start_token is None:
+                break
+            key = start_token.group(1)
+            end_token = re.search(fr"</s_{key}>", tokens, re.IGNORECASE)
+            start_token = start_token.group()
+            tokens_split = [tkn for tkn in tokens.split(delim) if tkn]
+            assert len(tokens_split) == len(confs)
+
+            if end_token is None:
+                # remove all occurences of start_token idxes from confs list
+                confs = [confs[i] for i, tkn in enumerate(tokens_split)
+                         if not re.search(start_token, tkn, re.IGNORECASE)]
+                tokens = tokens.replace(start_token, "")
+                tksplit = [tk for tk in tokens.split(delim) if tk]
+                assert len(tksplit) == len(confs)
+            else:
+                end_token = end_token.group()
+                start_token_escaped = re.escape(start_token)
+                end_token_escaped = re.escape(end_token)
+                content = re.search(f"{start_token_escaped}(.*?){end_token_escaped}", tokens, re.IGNORECASE)
+                if content is not None:
+                    start_tkn_esc_idx = None
+                    end_tkn_esc_idx = None
+                    for i, tkn in enumerate(tokens_split):
+                        # only take the first start token
+                        if start_tkn_esc_idx is None and re.search(start_token_escaped, tkn, re.IGNORECASE):
+                            start_tkn_esc_idx = i
+                        # end_token_escaped must exist after start_token_escaped_idx exists
+                        if start_tkn_esc_idx is not None and re.search(end_token_escaped, tkn, re.IGNORECASE):
+                            end_tkn_esc_idx = i
+                            break
+                    content = content.group(1).strip(delim)
+                    tksplit = [tk for tk in tokens.split(delim) if tk]
+                    content_confs = confs[start_tkn_esc_idx + 1: end_tkn_esc_idx]
+                    cntsplit = [tk for tk in content.split(delim) if tk]
+
+                    assert len(tokens_split) == len(confs)
+                    assert len(cntsplit) == len(content_confs)
+
+                    if r"<s_" in content and r"</s_" in content:  # non-leaf node
+                        value = self.token2json_with_confs(content, content_confs, delim, is_inner_val=True)
+                        if value:
+                            if len(value) == 1:
+                                value = value[0]
+                            output[key] = value
+                    else:  # leaf nodes
+                        output[key] = []
+                        leaf_content_confs = [content_confs[i] for i, tkn in enumerate(cntsplit)
+                                              if not(re.search(r"<sep/>", tkn, re.IGNORECASE))]
+                        for leaf_i, leaf in enumerate(content.split(r"<sep/>")):
+                            leaf = leaf.strip(delim)
+                            if (
+                                leaf in self.decoder.tokenizer.get_added_vocab()
+                                and leaf[0] == "<"
+                                and leaf[-2:] == "/>"
+                            ):
+                                leaf = leaf[1:-2]  # for categorical special tokens
+                            output[key].append([leaf.replace(self.DELIM, ' '), leaf_content_confs[leaf_i]])
+                        if len(output[key]) == 1:
+                            output[key] = output[key][0]
+                for i, tkn in enumerate(tokens_split):
+                    if re.search(end_token, tkn, re.IGNORECASE):
+                        confs = confs[i + 1:]
+                        break
+                tokens = tokens[tokens.find(end_token) + len(end_token):].strip(delim)
+                if tokens[:6] == r"<sep/>":  # non-leaf nodes
+                    return [output] + self.token2json_with_confs(tokens[6:], confs[1:], delim, is_inner_val=True)
+        if len(output):
+            return [output] if is_inner_val else output
+        else:
+            return [] if is_inner_val else {}
 
     @classmethod
     def from_pretrained(
