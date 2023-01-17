@@ -605,29 +605,27 @@ class DonutModel(PreTrainedModel):
             output_scores=True,
         )
 
-        decoder_output_confs = torch.amax(torch.stack(decoder_output.scores, dim=1).softmax(-1), 2).cpu().numpy()[0]
-        # add score for end token and wrap scores in a list
-        decoder_output_confs = [np.concatenate([decoder_output_confs, [1.]], axis=0)]
+        decoder_output_confs = torch.mean(
+            torch.amax(torch.stack(decoder_output.scores, dim=1).softmax(-1), 2),
+            dim=1
+        ).cpu().numpy()
 
-        output = {"predictions": list()}
-        print("Output list of Prediction:", output)
-        self.DELIM = "}~}~}~{"  # important, use a DELIM that has a very low prob of appearing in text
 
-        for seq, confs in self.decoder.batch_custom_decode(decoder_output.sequences, decoder_output_confs, self.DELIM):
-            eos_tkn, pad_tkn = self.decoder.tokenizer.eos_token, self.decoder.tokenizer.pad_token
-            split_seq = [tkn for tkn in seq.split(self.DELIM) if tkn]
-            confs = [confs[i] for i, tkn in enumerate(split_seq)
-                     if not(tkn.strip().lower() == eos_tkn.lower() or tkn.strip().lower() == pad_tkn.lower())]
-            seq = seq.replace(eos_tkn, "").replace(pad_tkn, "")
-            for i, tkn in enumerate(seq.split(self.DELIM)):
-                if re.search(r"<.*?>", tkn, re.IGNORECASE):  # remove first task start token conf
-                    confs.pop(i)
-                    break
-            seq = re.sub(r"<.*?>", "", seq, count=1).strip(self.DELIM)  # remove first task start token
+        output = {"predictions": list(), "confs":list()}
+        decoded_sequences = self.decoder.tokenizer.batch_decode(decoder_output.sequences)
+        for conf, seq in zip(decoder_output_confs, decoded_sequences) :
+            seq = seq.replace(self.decoder.tokenizer.eos_token, "").replace(self.decoder.tokenizer.pad_token, "")
+            seq = re.sub(r"<.*?>", "", seq, count=1).strip()  # remove first task start token
             if return_json:
-                output["predictions"].append(self.token2json_with_confs(seq, confs, delim=self.DELIM))
+                content = self.token2json(seq)
             else:
-                output["predictions"].append(seq)
+                content = seq
+            output["predictions"].append(
+                {"json":content, "conf":float(conf)}
+            )
+            
+            output["confs"].append(conf)
+
 
         if return_attentions:
             output["attentions"] = {
